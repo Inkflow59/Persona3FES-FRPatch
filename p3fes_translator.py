@@ -359,8 +359,7 @@ class P3FESTranslator:
     def reinsert_texts(self, file_path: Path, translated_texts: List[str]) -> bool:
         """
         Réinsère les textes traduits dans le fichier original.
-        Le fichier modifié est sauvegardé dans 'reinjected/' puis copié vers le fichier original.
-        Met à jour le hash du fichier dans processed_files.json après l'écrasement.
+        Gère les différences de taille entre les chaînes originales et traduites.
         """
         import json
         import shutil
@@ -375,73 +374,162 @@ class P3FESTranslator:
                 
             # PM1 : structure avancée avec offsets
             if extension == '.pm1':
-                # On relit le json d'extraction avancée
                 extracted_json = self.output_dir / 'extracted' / (file_path.stem + '.json')
                 if not extracted_json.exists():
                     logging.error(f"Fichier d'extraction avancée manquant : {extracted_json}")
                     return False
+                    
                 with open(extracted_json, 'r', encoding='utf-8') as f:
                     messages = json.load(f)
+                    
                 if len(messages) != len(translated_texts):
                     logging.error(f"Nombre de textes traduits ({len(translated_texts)}) différent du nombre de messages extraits ({len(messages)})")
                     return False
-                for msg, new_text in zip(messages, translated_texts):
+                
+                # Parcours des messages et des textes traduits
+                for i, (msg, new_text) in enumerate(zip(messages, translated_texts)):
                     chunk = bytearray.fromhex(msg['raw'])
-                    # On cherche la/les chaînes originales dans le chunk
-                    for old, _ in zip(msg['texts'], [new_text]*len(msg['texts'])):
+                    old_texts = msg['texts']
+                    
+                    # Pour chaque ancien texte dans le chunk
+                    for old_text in old_texts:
                         try:
-                            old_bytes = old.encode('shift_jis')
-                        except Exception:
+                            old_bytes = old_text.encode('shift_jis')
+                            idx = chunk.find(old_bytes)
+                            if idx == -1:
+                                continue
+                                
+                            # Réencodage du nouveau texte
+                            try:
+                                new_bytes = new_text.encode('shift_jis')
+                            except Exception as e:
+                                logging.warning(f"Erreur d'encodage pour '{new_text}': {e}")
+                                new_bytes = old_bytes
+                                
+                            # Gestion de la différence de taille
+                            if len(new_bytes) != len(old_bytes):
+                                # Si le nouveau texte est plus long, on essaie de le compresser
+                                if len(new_bytes) > len(old_bytes):
+                                    # On essaie d'abord de supprimer les espaces superflus
+                                    compressed_text = re.sub(r'\s+', ' ', new_text).strip()
+                                    compressed_bytes = compressed_text.encode('shift_jis')
+                                    
+                                    if len(compressed_bytes) <= len(old_bytes):
+                                        new_bytes = compressed_bytes
+                                    else:
+                                        # Si toujours trop long, on tronque intelligemment
+                                        max_chars = len(old_bytes)
+                                        while max_chars > 0 and new_bytes[max_chars-1:max_chars] != b' ':
+                                            max_chars -= 1
+                                        if max_chars > 0:
+                                            new_bytes = new_bytes[:max_chars]
+                                        else:
+                                            new_bytes = new_bytes[:len(old_bytes)]
+                                            
+                                        logging.warning(f"Texte tronqué: '{new_text}' -> '{new_bytes.decode('shift_jis', errors='ignore')}'")
+                                
+                                # Si le nouveau texte est plus court, on ajoute des espaces intelligemment
+                                elif len(new_bytes) < len(old_bytes):
+                                    # On ajoute des espaces à la fin, mais en préservant la structure
+                                    padding = b' ' * (len(old_bytes) - len(new_bytes))
+                                    new_bytes = new_bytes + padding
+                                
+                            # Remplacement dans le chunk
+                            chunk[idx:idx+len(old_bytes)] = new_bytes
+                            
+                        except Exception as e:
+                            logging.warning(f"Erreur lors du remplacement dans le chunk: {e}")
                             continue
-                        idx = chunk.find(old_bytes)
-                        if idx == -1:
-                            continue
-                        # Réencodage safe
-                        try:
-                            new_bytes = new_text.encode('shift_jis')
-                        except Exception:
-                            new_bytes = old_bytes
-                        if len(new_bytes) > len(old_bytes):
-                            # Tronque pour ne pas dépasser la taille d'origine
-                            new_bytes = new_bytes[:len(old_bytes)]
-                        elif len(new_bytes) < len(old_bytes):
-                            # Pad avec des espaces (0x20)
-                            new_bytes = new_bytes + b' ' * (len(old_bytes) - len(new_bytes))
-                        chunk[idx:idx+len(old_bytes)] = new_bytes
-                    # Remplace le chunk dans le fichier binaire
-                    data[msg['offset']:msg['offset']+len(chunk)] = chunk
+                            
+                    # Remplacement du chunk dans le fichier
+                    try:
+                        data[msg['offset']:msg['offset']+len(chunk)] = chunk
+                    except Exception as e:
+                        logging.error(f"Erreur lors du remplacement du chunk: {e}")
+                        return False
+                        
             # PAC/PAK/BF/TBL : remplacement simple des chaînes imprimables
             elif extension in {'.pac', '.pak', '.bf', '.tbl'}:
-                # On relit les chaînes extraites
                 extracted_json = self.output_dir / 'extracted' / (file_path.stem + '.json')
                 if not extracted_json.exists():
                     logging.error(f"Fichier d'extraction manquant : {extracted_json}")
                     return False
+                    
                 with open(extracted_json, 'r', encoding='utf-8') as f:
-                    old_strings = json.load(f)
-                if len(old_strings) != len(translated_texts):
-                    logging.error(f"Nombre de textes traduits ({len(translated_texts)}) différent du nombre de chaînes extraites ({len(old_strings)})")
+                    extracted_data = json.load(f)
+                    
+                if not isinstance(extracted_data, list):
+                    logging.error("Format de données d'extraction invalide")
                     return False
-                for old, new in zip(old_strings, translated_texts):
+                    
+                if len(extracted_data) != len(translated_texts):
+                    logging.error(f"Nombre de textes traduits ({len(translated_texts)}) différent du nombre de chaînes extraites ({len(extracted_data)})")
+                    return False
+                    
+                # Parcours des textes extraits et traduits
+                for old_data, new_text in zip(extracted_data, translated_texts):
                     try:
-                        old_bytes = old.encode('shift_jis')
-                    except Exception:
-                        continue
-                    try:
-                        new_bytes = new.encode('shift_jis')
-                    except Exception:
-                        new_bytes = old_bytes
-                    if len(new_bytes) > len(old_bytes):
-                        new_bytes = new_bytes[:len(old_bytes)]
-                    elif len(new_bytes) < len(old_bytes):
-                        new_bytes = new_bytes + b' ' * (len(old_bytes) - len(new_bytes))
-                    idx = data.find(old_bytes)
-                    if idx != -1:
+                        # Extraction du texte original
+                        if isinstance(old_data, dict) and 'texts' in old_data:
+                            old_text = old_data['texts'][0]
+                        elif isinstance(old_data, str):
+                            old_text = old_data
+                        else:
+                            continue
+                            
+                        old_bytes = old_text.encode('shift_jis')
+                        idx = data.find(old_bytes)
+                        
+                        if idx == -1:
+                            logging.warning(f"Texte original non trouvé: {old_text}")
+                            continue
+                            
+                        # Réencodage du nouveau texte
+                        try:
+                            new_bytes = new_text.encode('shift_jis')
+                        except Exception as e:
+                            logging.warning(f"Erreur d'encodage pour '{new_text}': {e}")
+                            continue
+                            
+                        # Gestion de la différence de taille
+                        if len(new_bytes) != len(old_bytes):
+                            # Si le nouveau texte est plus long, on essaie de le compresser
+                            if len(new_bytes) > len(old_bytes):
+                                # On essaie d'abord de supprimer les espaces superflus
+                                compressed_text = re.sub(r'\s+', ' ', new_text).strip()
+                                compressed_bytes = compressed_text.encode('shift_jis')
+                                
+                                if len(compressed_bytes) <= len(old_bytes):
+                                    new_bytes = compressed_bytes
+                                else:
+                                    # Si toujours trop long, on tronque intelligemment
+                                    max_chars = len(old_bytes)
+                                    while max_chars > 0 and new_bytes[max_chars-1:max_chars] != b' ':
+                                        max_chars -= 1
+                                    if max_chars > 0:
+                                        new_bytes = new_bytes[:max_chars]
+                                    else:
+                                        new_bytes = new_bytes[:len(old_bytes)]
+                                        
+                                    logging.warning(f"Texte tronqué: '{new_text}' -> '{new_bytes.decode('shift_jis', errors='ignore')}'")
+                            
+                            # Si le nouveau texte est plus court, on ajoute des espaces intelligemment
+                            elif len(new_bytes) < len(old_bytes):
+                                # On ajoute des espaces à la fin, mais en préservant la structure
+                                padding = b' ' * (len(old_bytes) - len(new_bytes))
+                                new_bytes = new_bytes + padding
+                            
+                        # Remplacement dans le fichier
                         data[idx:idx+len(old_bytes)] = new_bytes
+                        
+                    except Exception as e:
+                        logging.warning(f"Erreur lors du remplacement: {e}")
+                        continue
+                        
             else:
                 logging.warning(f"Réinsertion non implémentée pour {extension}")
                 return False
-            
+                
             # Sauvegarde dans le dossier reinjected
             with open(out_file, 'wb') as f:
                 f.write(data)
