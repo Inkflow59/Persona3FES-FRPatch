@@ -10,13 +10,13 @@ from typing import Dict, List, Optional
 import shutil
 from datetime import datetime
 from deep_translator import GoogleTranslator
-from googletrans import Translator as PyGoogleTranslator
 import requests
 import time
 import re
 import sys
 import subprocess
 from dotenv import load_dotenv
+from transformers import pipeline, AutoModelForSequenceClassification, AutoTokenizer
 
 # Chargement des variables d'environnement
 load_dotenv()
@@ -199,8 +199,20 @@ class P3FESTranslator:
         
         self.special_tokens = SpecialTokens()
         
-        # Initialisation du traducteur de secours
-        self.backup_translator = PyGoogleTranslator()
+        # Initialisation du traducteur Google
+        self.translator = GoogleTranslator(source='en', target='fr')
+        
+        # Initialisation du modèle Hugging Face pour l'analyse de texte
+        try:
+            self.text_classifier = pipeline(
+                "text-classification",
+                model="facebook/roberta-hate-speech-dynabench-r4-target",
+                device=-1  # CPU
+            )
+            logging.info("Modèle Hugging Face chargé avec succès")
+        except Exception as e:
+            logging.error(f"Erreur lors du chargement du modèle Hugging Face: {e}")
+            self.text_classifier = None
 
     def _load_processed_files(self) -> Dict[str, str]:
         """Charge la liste des fichiers déjà traités depuis le fichier log."""
@@ -278,117 +290,9 @@ class P3FESTranslator:
             logging.error(f"Erreur extraction {extension}: {e}")
             return None
 
-    def translate_with_backup(self, text: str) -> str:
-        """Traduit un texte avec py-googletrans comme solution de secours."""
-        try:
-            result = self.backup_translator.translate(text, src='en', dest='fr')
-            return result.text
-        except Exception as e:
-            logging.error(f"Erreur lors de la traduction avec py-googletrans: {e}")
-            return text
-
-    def is_valid_sentence(self, text: str) -> bool:
-        """
-        Analyse si une phrase est valide pour la traduction.
-        """
-        # Nettoyage du texte
-        text = text.strip()
-        
-        # Critères de base
-        if not text or len(text) < 3:
-            return False
-        
-        # Vérification de la structure grammaticale basique
-        words = text.split()
-        if len(words) < 2:  # Au moins 2 mots
-            return False
-        
-        # Vérification de la ponctuation
-        has_punctuation = any(c in text for c in '.!?,;:')
-        
-        # Vérification de la casse
-        has_proper_case = any(c.isupper() for c in text) and not text.isupper()
-        
-        # Vérification des caractères spéciaux
-        special_chars = re.findall(r'[^a-zA-Z0-9\s.,!?;:\'\"-]', text)
-        if len(special_chars) > len(text) * 0.3:  # Plus de 30% de caractères spéciaux
-            return False
-        
-        # Vérification de la cohérence des espaces
-        if '  ' in text or text.startswith(' ') or text.endswith(' '):
-            return False
-        
-        return has_punctuation or has_proper_case
-
-    def analyze_context(self, text: str, previous_text: str = None, next_text: str = None) -> bool:
-        """
-        Analyse le contexte d'une phrase pour déterminer si elle doit être traduite.
-        """
-        # Si le texte précédent ou suivant est un code technique, on peut ignorer
-        if previous_text and re.match(r'^[A-Z0-9_]+$', previous_text):
-            return False
-        if next_text and re.match(r'^[A-Z0-9_]+$', next_text):
-            return False
-        
-        # Si le texte est entouré de guillemets, c'est probablement un dialogue
-        if text.startswith('"') and text.endswith('"'):
-            return True
-        
-        # Si le texte est entouré de parenthèses, c'est probablement une note
-        if text.startswith('(') and text.endswith(')'):
-            return True
-        
-        return True
-
-    def should_skip_translation(self, text: str, whitelist: List[str], previous_text: str = None, next_text: str = None) -> bool:
-        # Extraction des tokens et du texte propre
-        tokens, clean_text = self.special_tokens.extract_game_tokens(text)
-        
-        # Si le texte ne contient que des tokens spéciaux
-        if not clean_text.strip():
-            return True
-        
-        # Patterns à ignorer
-        skip_patterns = [
-            r'^\d+$',  # Nombres seuls
-            r'^[A-Z0-9_]+$',  # Codes techniques
-            r'^[A-Z]{2,}$',  # Acronymes
-            r'^[a-z]+$',  # Mots en minuscules seuls
-            r'^[A-Z][a-z]+$',  # Noms propres simples
-            r'^[A-Z][a-z]+\s+[A-Z][a-z]+$',  # Noms composés
-            r'^[A-Z][a-z]+\s+[A-Z][a-z]+\s+[A-Z][a-z]+$',  # Noms triples
-            r'^[A-Z][a-z]+\s+[A-Z][a-z]+\s+[A-Z][a-z]+\s+[A-Z][a-z]+$',  # Noms quadruples
-        ]
-        
-        # Vérification des patterns
-        for pattern in skip_patterns:
-            if re.match(pattern, clean_text):
-                return True
-        
-        # Vérification de la structure de la phrase
-        if not self.is_valid_sentence(clean_text):
-            return True
-        
-        # Vérification du contexte
-        if not self.analyze_context(clean_text, previous_text, next_text):
-            return True
-        
-        # Vérification des tokens spéciaux
-        if self.special_tokens.is_special_token(clean_text):
-            return True
-        
-        return False
-
-    def print_progress(self, current: int, total: int, text: str):
-        """Affiche la progression de la traduction avec le texte en cours."""
-        progress = (current / total) * 100
-        sys.stdout.write(f"\rTraduction en cours : {progress:.1f}% - Texte {current}/{total}: {text[:50]}...")
-        sys.stdout.flush()
-
     def translate_texts(self, texts: List[str], file_path: Path = None) -> List[str]:
         """
         Traduit les textes de l'anglais vers le français avec Google Translator.
-        En cas d'échec, utilise py-googletrans comme traducteur de secours.
         """
         import time
         import json
@@ -400,32 +304,9 @@ class P3FESTranslator:
             "Yukari", "Mitsuru", "Fuuka", "Akihiko", "Tartarus", "Nyx", "SEES", "Aigis", "Junpei", "Shinjiro", "Koromaru", "Elizabeth", "Igor", "Pharos", "Ryoji", "Chidori", "Strega", "Ikutsuki", "Takaya", "Jin", "Ken", "Persona", "Evoker", "S.E.E.S.", "Aragaki", "Makoto", "Minato", "Protagonist", "Yamagishi", "Sanada", "Takeba", "Iori", "Amada", "Tanaka", "Velvet Room", "Paulownia Mall", "Gekkoukan", "Mitsuru Kirijo", "Yukari Takeba", "Fuuka Yamagishi", "Akihiko Sanada", "Junpei Iori", "Shinjiro Aragaki", "Ken Amada", "Koromaru", "Aigis", "Elizabeth", "Igor", "Pharos", "Ryoji Mochizuki", "Chidori", "Takaya", "Jin", "Ikutsuki", "Strega", "Nyx Avatar", "Nyx", "Tartarus", "SEES", "Persona", "Evoker", "S.E.E.S."
         ]
 
-        def is_proper_name(text, whitelist):
-            if text in whitelist:
-                return True
-            # Si le texte commence par une majuscule et n'est pas tout en majuscules, et fait moins de 3 mots
-            if text and text[0].isupper() and not text.isupper() and len(text.split()) <= 3:
-                return True
-            return False
-
-        def is_normal_sentence(text):
-            # Une phrase normalement constituée contient au moins un espace et n'est pas tout en majuscules ni un nom propre.
-            if not text.strip():
-                return False
-            if text.isupper():
-                return False
-            if re.match(r'^MSG_\d+$', text):
-                return False
-            if " " not in text:
-                return False
-            return True
-
         translated = []
         
         try:
-            # Initialisation du traducteur Google
-            google_translator = GoogleTranslator(source='en', target='fr')
-            
             total_texts = len(texts)
             
             for i, text in enumerate(texts, 1):
@@ -443,20 +324,14 @@ class P3FESTranslator:
                     continue
                     
                 try:
-                    # Première tentative avec Google Translate
-                    fr = google_translator.translate(clean_text)
-                except Exception as e:
-                    try:
-                        # Tentative de secours avec py-googletrans
-                        fr = self.translate_with_backup(clean_text)
-                        if fr != text:  # Si la traduction a réussi
-                            logging.info(f"py-googletrans a réussi à traduire le texte après échec de Google Translate")
-                        else:
-                            logging.warning("Échec de py-googletrans, retour au texte original")
-                            fr = text
-                    except Exception as e2:
-                        logging.error(f"Échec des deux traducteurs sur '{text}': Google={e}, py-googletrans={e2}")
+                    # Traduction avec Google Translate
+                    fr = self.translator.translate(clean_text)
+                    if not fr:  # Si la traduction échoue
+                        logging.warning(f"Échec de la traduction pour '{text}', retour au texte original")
                         fr = text
+                except Exception as e:
+                    logging.error(f"Erreur lors de la traduction de '{text}': {e}")
+                    fr = text
                 
                 # Reconstruction avec les tokens originaux
                 fr = self.special_tokens.reconstruct_text(fr, tokens)
@@ -466,7 +341,7 @@ class P3FESTranslator:
             print()
 
         except Exception as e:
-            logging.error(f"Erreur d'initialisation des traducteurs : {e}")
+            logging.error(f"Erreur lors de la traduction : {e}")
             return texts
 
         # Sauvegarde dans un fichier à part si file_path est fourni
@@ -632,6 +507,132 @@ class P3FESTranslator:
                 file_path = Path(root) / file
                 if file_path.suffix.lower() in self.supported_extensions:
                     self.process_file(file_path)
+
+    def print_progress(self, current: int, total: int, text: str):
+        """Affiche la progression de la traduction avec le texte en cours."""
+        progress = (current / total) * 100
+        sys.stdout.write(f"\rTraduction en cours : {progress:.1f}% - Texte {current}/{total}: {text[:50]}...")
+        sys.stdout.flush()
+
+    def should_skip_translation(self, text: str, whitelist: List[str], previous_text: str = None, next_text: str = None) -> bool:
+        # Extraction des tokens et du texte propre
+        tokens, clean_text = self.special_tokens.extract_game_tokens(text)
+        
+        # Si le texte ne contient que des tokens spéciaux
+        if not clean_text.strip():
+            return True
+            
+        # Si le texte est dans la whitelist, on le garde tel quel
+        if clean_text in whitelist:
+            return False
+            
+        # Patterns à ignorer (liste réduite)
+        skip_patterns = [
+            r'^\d+$',  # Nombres seuls
+            r'^[A-Z0-9_]+$',  # Codes techniques
+            r'^[A-Z]{2,}$',  # Acronymes
+        ]
+        
+        # Vérification des patterns
+        for pattern in skip_patterns:
+            if re.match(pattern, clean_text):
+                return True
+                
+        # Utilisation du modèle Hugging Face si disponible
+        if self.text_classifier is not None:
+            try:
+                result = self.text_classifier(clean_text)[0]
+                # Si le texte est classé comme "hate" (non naturel), on le rejette
+                if result['label'] == 'hate':
+                    return True
+                # Si le score de confiance est trop bas, on le rejette
+                if result['score'] < 0.3:  # Seuil plus bas pour être moins strict
+                    return True
+            except Exception as e:
+                logging.warning(f"Erreur lors de l'analyse du texte avec le modèle: {e}")
+        
+        # Vérification de la structure de la phrase
+        if not self.is_valid_sentence(clean_text):
+            return True
+            
+        # Vérification du contexte
+        if not self.analyze_context(clean_text, previous_text, next_text):
+            return True
+            
+        # Vérification des tokens spéciaux
+        if self.special_tokens.is_special_token(clean_text):
+            return True
+            
+        return False
+
+    def is_valid_sentence(self, text: str) -> bool:
+        """
+        Vérifie si le texte est une phrase valide à traduire.
+        
+        Args:
+            text (str): Le texte à valider
+            
+        Returns:
+            bool: True si le texte est une phrase valide, False sinon
+        """
+        # Si le texte est vide ou ne contient que des espaces
+        if not text or not text.strip():
+            return False
+            
+        # Vérification de la longueur minimale (au moins 2 caractères)
+        if len(text.strip()) < 2:
+            return False
+            
+        # Patterns de phrases invalides
+        invalid_patterns = [
+            r'^[^a-zA-Z]*$',  # Ne contient aucune lettre
+            r'^[A-Z0-9\s_\-]+$',  # Ne contient que des majuscules, chiffres et caractères spéciaux
+            r'^[!@#$%^&*()_+\-=\[\]{};\'"\\|,.<>\/?]+$',  # Ne contient que des caractères spéciaux
+            r'^\d+$',  # Ne contient que des chiffres
+            r'^[A-Z]{2,}$',  # Acronymes en majuscules
+            r'^[A-Z0-9_]+$',  # Codes techniques
+        ]
+        
+        # Vérification des patterns invalides
+        for pattern in invalid_patterns:
+            if re.match(pattern, text):
+                return False
+                
+        # Vérification de la présence d'au moins une voyelle (pour éviter les abréviations)
+        if not any(vowel in text.lower() for vowel in 'aeiouy'):
+            return False
+            
+        # Vérification de la présence d'au moins une lettre minuscule (pour éviter les codes)
+        if not any(c.islower() for c in text):
+            return False
+            
+        return True
+
+    def analyze_context(self, text: str, previous_text: str = None, next_text: str = None) -> bool:
+        """
+        Analyse le contexte d'une phrase pour déterminer si elle doit être traduite.
+        
+        Args:
+            text (str): Le texte à analyser
+            previous_text (str, optional): Le texte précédent
+            next_text (str, optional): Le texte suivant
+            
+        Returns:
+            bool: True si le texte doit être traduit selon son contexte, False sinon
+        """
+        # Si le texte est vide, on ne le traduit pas
+        if not text or not text.strip():
+            return False
+            
+        # Si le texte précédent ou suivant est identique, c'est probablement un code
+        if (previous_text and text == previous_text) or (next_text and text == next_text):
+            return False
+            
+        # Si le texte précédent ou suivant est très similaire (différence de casse uniquement)
+        if (previous_text and text.lower() == previous_text.lower()) or (next_text and text.lower() == next_text.lower()):
+            return False
+            
+        return True
 
 def main():
     """Point d'entrée principal du programme."""

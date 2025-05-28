@@ -2,10 +2,11 @@
 
 <div align="center">
 
-![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)
+![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.8%2B-green.svg)
 ![Licence](https://img.shields.io/badge/licence-MIT-yellow.svg)
 ![Statut](https://img.shields.io/badge/statut-en%20développement-orange.svg)
+![IA](https://img.shields.io/badge/IA-Hugging%20Face-purple.svg)
 
 [English](README.md) | [Français](README.fr.md)
 
@@ -29,11 +30,12 @@
 
 ## 🎯 À propos
 
-Ce projet vise à automatiser la traduction des fichiers de texte du jeu Persona 3 FES de l'anglais vers le français. Il utilise des algorithmes avancés pour préserver les tokens spéciaux du jeu tout en assurant une traduction de qualité.
+Ce projet vise à automatiser la traduction des fichiers de texte du jeu Persona 3 FES de l'anglais vers le français. Il utilise des algorithmes avancés et l'intelligence artificielle pour préserver les tokens spéciaux du jeu tout en assurant une traduction de qualité optimale.
 
 ### 🎮 Fonctionnalités principales
 
 - 🔄 Traduction automatique avec double système de secours
+- 🧠 Analyse intelligente des textes avec Hugging Face
 - 🛡️ Préservation intelligente des tokens spéciaux
 - 📝 Gestion contextuelle des noms propres
 - 📊 Suivi des fichiers traités
@@ -42,23 +44,32 @@ Ce projet vise à automatiser la traduction des fichiers de texte du jeu Persona
 
 ## ✨ Fonctionnalités détaillées
 
+### 🧠 Analyse intelligente des textes
+- Utilisation du modèle Hugging Face pour l'analyse de texte
+- Détection précise des phrases traduisibles
+- Filtrage intelligent des textes non naturels
+- Adaptation contextuelle des critères de traduction
+
 ### 🎯 Traduction intelligente
 - Utilisation de Google Translate comme traducteur principal
 - Py-googletrans comme système de secours
 - Analyse contextuelle des phrases
 - Préservation des noms propres et termes techniques
+- Optimisation des critères de sélection des textes
 
 ### 🛡️ Protection des données
 - Préservation des tokens spéciaux du jeu
 - Gestion des messages en majuscules
 - Protection des codes de formatage
 - Conservation de la structure des fichiers
+- Analyse avancée des caractères spéciaux
 
 ### 📊 Suivi et logs
 - Journalisation détaillée des opérations
 - Suivi des fichiers déjà traités
 - Statistiques de traduction
 - Rapports d'erreurs détaillés
+- Logs d'analyse du modèle Hugging Face
 
 ## 🚀 Installation
 
@@ -66,6 +77,7 @@ Ce projet vise à automatiser la traduction des fichiers de texte du jeu Persona
 - Python 3.8 ou supérieur
 - Git (optionnel)
 - Connexion Internet stable
+- 2GB d'espace disque (pour les modèles IA)
 
 ### Installation rapide
 
@@ -76,6 +88,9 @@ cd Persona3FES-FRPatch
 
 # Installer les dépendances
 pip install -r requirements.txt
+
+# Télécharger les modèles Hugging Face (automatique au premier lancement)
+python p3fes_translator.py --download-models
 ```
 
 ## ⚙️ Configuration
@@ -91,6 +106,10 @@ BACKUP_TRANSLATOR_TIMEOUT=30
 # Configuration des logs
 LOG_LEVEL=INFO
 LOG_FILE=translation.log
+
+# Configuration du modèle Hugging Face
+HUGGINGFACE_MODEL=facebook/roberta-hate-speech-dynabench-r4-target
+MODEL_CONFIDENCE_THRESHOLD=0.3
 ```
 
 ### Préparation des fichiers
@@ -140,11 +159,14 @@ Persona3FES-FRPatch/
 | Erreur de traduction | Vérifier la connexion Internet et les logs |
 | Fichiers non trouvés | Vérifier les permissions et le chemin |
 | Erreur d'encodage | Vérifier le format des fichiers source |
+| Erreur modèle IA | Vérifier l'espace disque et la connexion Internet |
+| Textes non traduits | Vérifier les logs d'analyse du modèle |
 
 ### Logs et débogage
 - Consultez `translation.log` pour les détails
 - Utilisez le mode verbose pour plus d'informations
 - Vérifiez les permissions des dossiers
+- Analysez les logs du modèle Hugging Face
 
 ## 🤝 Contribution
 
@@ -158,9 +180,11 @@ Les contributions sont les bienvenues ! Assurez-vous d'avoir une copie légale d
 
 ### Points d'amélioration recherchés
 - 🎯 Amélioration de la qualité des traductions
+- 🧠 Optimisation du modèle d'analyse de texte
 - 🔧 Support de nouveaux formats de fichiers
 - 📝 Documentation plus détaillée
 - 🐛 Correction de bugs
+- 🤖 Intégration d'autres modèles d'IA
 
 ## 📝 Licence
 
