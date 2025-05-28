@@ -1,0 +1,9 @@
+#Fichiers du jeu
+*.iso
+GameFiles/
+PersonaEditor/
+
+#Fichiers locaux inutiles
+*.log
+*.env
+TranslatedFiles/

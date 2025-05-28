@@ -1,0 +1,20 @@
+# Dépendances principales
+requests>=2.31.0
+python-dotenv>=1.0.0
+chardet>=5.2.0
+deep-translator>=1.11.4
+py-googletrans>=4.0.0-rc1
+pathlib>=1.0.1
+typing>=3.7.4.3
+
+# Pour le traitement des fichiers binaires
+structlog>=23.2.0
+bitstring>=4.1.2
+
+# Pour le logging et le débogage
+rich>=13.7.0
+tqdm>=4.66.1
+
+# Pour les tests
+pytest>=7.4.3
+pytest-cov>=4.1.0 
