@@ -6,4 +6,5 @@ PersonaEditor/
 #Fichiers locaux inutiles
 *.log
 *.env
+*.venv
 TranslatedFiles/
