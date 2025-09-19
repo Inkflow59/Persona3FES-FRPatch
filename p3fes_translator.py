@@ -843,12 +843,13 @@ class P3FESTranslator:
         try:
             self.text_classifier = pipeline(
                 "text-classification",
-                model="facebook/roberta-hate-speech-dynabench-r4-target",
+                model="cardiffnlp/twitter-roberta-base-sentiment-latest",
                 device=-1  # CPU
             )
             logging.info("Modèle Hugging Face chargé avec succès")
         except Exception as e:
-            logging.error(f"Erreur lors du chargement du modèle Hugging Face: {e}")
+            logging.warning(f"Modèle Hugging Face non disponible: {e}")
+            logging.info("Continuera sans analyse de sentiment avancée")
             self.text_classifier = None
 
     def _load_processed_files(self) -> Dict[str, str]:
