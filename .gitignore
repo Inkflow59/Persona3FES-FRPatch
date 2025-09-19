@@ -8,3 +8,13 @@ PersonaEditor/
 *.env
 *.venv
 TranslatedFiles/
+
+#Fichiers de sortie des tests
+test_output/
+TestOutput/
+
+#Fichiers de configuration de l'IDE
+.vscode/
+
+#Fichiers caches
+__pycache__/
