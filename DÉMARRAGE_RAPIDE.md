@@ -50,15 +50,14 @@ Le système détecte maintenant automatiquement les fichiers déjà traduits et 
 - **Partiellement traduit** 🔶 : Contient du français et de l'anglais
 - **Non traduit** ❌ : Contient principalement de l'anglais
 - **Sans texte** 📄 : Aucun texte détecté
-
+---
 ## 🔬 NOUVEAUTÉS - ANALYSE INTELLIGENTE
 
 ✅ INSTALLATION RÉUSSIE !
 
 Votre script de traduction avec analyse automatique est maintenant opérationnel.
-
+---
 ### 🚀 MODES D'UTILISATION
-======================
 
 **🔍 NOUVEAU ! Mode Analyse Intelligente**
 ```
@@ -101,9 +100,8 @@ Traite tous les fichiers avec extensions connues (.pm1, .pac, .pak, .bf, .tbl)
 python p3fes_translator.py --test
 ```
 Affiche les textes qui seraient traduits sans modifier vos fichiers.
-
+---
 ## 🔧 OPTIONS AVANCÉES
-===================
 
 **Contrôle de la sensibilité**
 ```
@@ -126,9 +124,8 @@ python p3fes_translator.py --file GameFiles/MSG_001.pm1
 ```
 python p3fes_translator.py --verbose --auto-test
 ```
-
+---
 ## NOUVEAUTÉS - ANALYSE INTELLIGENTE
-====================================
 
 Le système analyse maintenant TOUS vos fichiers (pas seulement ceux avec extensions connues) et :
 
@@ -138,9 +135,8 @@ Le système analyse maintenant TOUS vos fichiers (pas seulement ceux avec extens
 ✅ **Reconnaît les termes** spécifiques à Persona (Tartarus, SEES, Velvet Room, etc.)
 ✅ **Teste les méthodes** de réinsertion pour choisir la plus sûre
 ✅ **Génère des rapports** détaillés sur l'analyse
-
+---
 ## STRATÉGIES DE RÉINSERTION ADAPTATIVES
-========================================
 
 Le système choisit automatiquement la meilleure méthode selon le fichier :
 
@@ -148,9 +144,8 @@ Le système choisit automatiquement la meilleure méthode selon le fichier :
 - **Aggressive** : Tente de maximiser les traductions
 - **Safe** : Crée des sauvegardes supplémentaires et vérifie l'intégrité
 - **Test-First** : Teste toutes les méthodes et choisit la meilleure
-
+---
 ## 📁 STRUCTURE DES RÉSULTATS
-==========================
 
 ```
 TranslatedFiles/
@@ -161,9 +156,8 @@ TranslatedFiles/
     ├── file_analysis_report.json          # Analyse des fichiers
     └── reinsertion_test_results.json      # Résultats des tests
 ```
-
+---
 ## 🛠️ GUIDE DE DÉPANNAGE
-=====================
 
 | Problème | Solution |
 |----------|----------|
@@ -172,17 +166,15 @@ TranslatedFiles/
 | "Trop de fichiers analysés" | Utilisez --max-files pour limiter |
 | "Score de confiance faible" | Vérifiez que vos fichiers contiennent du texte |
 | "Erreur de connexion" | Vérifiez votre connexion Internet |
-
+---
 ## 🧪 TESTER VOTRE INSTALLATION
-============================
 
 ```
 python test_installation.py      # Tests de base
 python test_reinsert.py          # Tests avancés de réimplémentation
 ```
-
-## � RECOMMANDATIONS D'USAGE
-==========================
+---
+## RECOMMANDATIONS D'USAGE
 
 1. **Premier usage** : `python p3fes_translator.py --analyze`
 2. **Si beaucoup de fichiers prometteurs** : `python p3fes_translator.py --auto-test`
