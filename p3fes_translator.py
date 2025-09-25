@@ -8,7 +8,7 @@ import hashlib
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import shutil
-from datetime import datetime
+from datetime import datetime, timedelta
 from deep_translator import GoogleTranslator
 import requests
 import time
@@ -20,6 +20,19 @@ from transformers import pipeline, AutoModelForSequenceClassification, AutoToken
 import struct
 import mimetypes
 from collections import defaultdict, Counter
+import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
+
+# Interface graphique optionnelle
+try:
+    import tkinter as tk
+    from tkinter import ttk, filedialog, messagebox
+    GUI_AVAILABLE = True
+except ImportError:
+    GUI_AVAILABLE = False
+    logging.warning("Interface graphique non disponible (tkinter manquant)")
 
 # Chargement des variables d'environnement
 load_dotenv()
@@ -808,6 +821,194 @@ class AdaptiveReinsertionManager:
             if backup_file.exists():
                 backup_file.unlink()
 
+class TranslationCache:
+    """Cache SQLite intelligent pour les traductions avec TTL."""
+    
+    def __init__(self, cache_dir: Path, ttl_hours: int = 24*7):
+        self.cache_file = cache_dir / "translation_cache.db"
+        self.ttl = timedelta(hours=ttl_hours)
+        self.cache_dir = cache_dir
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+        self._lock = threading.Lock()
+    
+    def _init_db(self):
+        """Initialise la base de données SQLite."""
+        with sqlite3.connect(self.cache_file) as conn:
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS translations (
+                    text_hash TEXT PRIMARY KEY,
+                    original_text TEXT NOT NULL,
+                    translated_text TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    access_count INTEGER DEFAULT 1
+                )
+            ''')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_created_at ON translations(created_at)')
+    
+    def get(self, text: str) -> Optional[str]:
+        """Récupère une traduction du cache."""
+        text_hash = hashlib.sha256(text.encode('utf-8')).hexdigest()
+        
+        with self._lock:
+            with sqlite3.connect(self.cache_file) as conn:
+                cursor = conn.execute(
+                    'SELECT translated_text, created_at FROM translations WHERE text_hash = ?',
+                    (text_hash,)
+                )
+                row = cursor.fetchone()
+                
+                if row:
+                    created_at = datetime.fromisoformat(row[1])
+                    if datetime.now() - created_at < self.ttl:
+                        # Mettre à jour les stats d'accès
+                        conn.execute(
+                            'UPDATE translations SET accessed_at = ?, access_count = access_count + 1 WHERE text_hash = ?',
+                            (datetime.now().isoformat(), text_hash)
+                        )
+                        return row[0]
+                    else:
+                        # Supprimer l'entrée expirée
+                        conn.execute('DELETE FROM translations WHERE text_hash = ?', (text_hash,))
+        return None
+    
+    def put(self, text: str, translation: str):
+        """Stocke une traduction dans le cache."""
+        text_hash = hashlib.sha256(text.encode('utf-8')).hexdigest()
+        now = datetime.now().isoformat()
+        
+        with self._lock:
+            with sqlite3.connect(self.cache_file) as conn:
+                conn.execute('''
+                    INSERT OR REPLACE INTO translations 
+                    (text_hash, original_text, translated_text, created_at, accessed_at, access_count)
+                    VALUES (?, ?, ?, ?, ?, 1)
+                ''', (text_hash, text, translation, now, now))
+    
+    def cleanup_expired(self) -> int:
+        """Nettoie les entrées expirées."""
+        cutoff = datetime.now() - self.ttl
+        with self._lock:
+            with sqlite3.connect(self.cache_file) as conn:
+                cursor = conn.execute(
+                    'DELETE FROM translations WHERE datetime(created_at) < ?',
+                    (cutoff.isoformat(),)
+                )
+                return cursor.rowcount
+    
+    def get_stats(self) -> Dict:
+        """Retourne les statistiques du cache."""
+        with self._lock:
+            with sqlite3.connect(self.cache_file) as conn:
+                cursor = conn.execute('''
+                    SELECT COUNT(*) as total,
+                           SUM(access_count) as total_hits,
+                           COUNT(CASE WHEN datetime(created_at) > datetime('now', '-24 hours') THEN 1 END) as recent
+                    FROM translations
+                ''')
+                row = cursor.fetchone()
+                return {
+                    'total_entries': row[0] or 0,
+                    'total_hits': row[1] or 0,
+                    'recent_entries': row[2] or 0
+                }
+
+class EnhancedTranslationService:
+    """Service de traduction amélioré avec retry, cache et fallback."""
+    
+    def __init__(self, cache_dir: Path):
+        self.cache = TranslationCache(cache_dir)
+        self.translator = GoogleTranslator(source='en', target='fr')
+        self.stats = {
+            'translations_requested': 0,
+            'cache_hits': 0,
+            'translation_errors': 0,
+            'successful_translations': 0
+        }
+        self._session = requests.Session()
+        # Configuration retry pour requests
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+        
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        self._session.mount("http://", adapter)
+        self._session.mount("https://", adapter)
+    
+    def translate_with_retry(self, text: str, max_retries: int = 3) -> str:
+        """Traduit un texte avec retry automatique."""
+        self.stats['translations_requested'] += 1
+        
+        # Vérifier le cache d'abord
+        cached = self.cache.get(text)
+        if cached:
+            self.stats['cache_hits'] += 1
+            return cached
+        
+        # Essayer la traduction avec retry
+        for attempt in range(max_retries):
+            try:
+                translated = self.translator.translate(text)
+                if translated and translated.strip():
+                    # Succès - sauvegarder dans le cache
+                    self.cache.put(text, translated)
+                    self.stats['successful_translations'] += 1
+                    return translated
+            except Exception as e:
+                logging.warning(f"Tentative {attempt + 1}/{max_retries} échouée: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(min(2 ** attempt, 10))  # Backoff exponentiel
+        
+        # Toutes les tentatives ont échoué
+        self.stats['translation_errors'] += 1
+        logging.error(f"Échec complet de traduction pour '{text[:50]}...'")
+        return text  # Retourner le texte original
+    
+    def translate_batch(self, texts: List[str], max_workers: int = 3) -> List[str]:
+        """Traduit un lot de textes en parallèle."""
+        if not texts:
+            return []
+        
+        results = [None] * len(texts)
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Soumettre toutes les tâches
+            future_to_index = {
+                executor.submit(self.translate_with_retry, text): i
+                for i, text in enumerate(texts)
+            }
+            
+            # Collecter les résultats dans l'ordre
+            for future in as_completed(future_to_index):
+                index = future_to_index[future]
+                try:
+                    results[index] = future.result()
+                except Exception as e:
+                    logging.error(f"Erreur traduction batch index {index}: {e}")
+                    results[index] = texts[index]  # Fallback au texte original
+        
+        return results
+    
+    def get_cache_stats(self) -> Dict:
+        """Retourne les statistiques combinées."""
+        cache_stats = self.cache.get_stats()
+        hit_rate = (self.stats['cache_hits'] / max(self.stats['translations_requested'], 1)) * 100
+        
+        return {
+            'service_stats': self.stats,
+            'cache_stats': cache_stats,
+            'cache_hit_rate': round(hit_rate, 1)
+        }
+    
+    def cleanup_cache(self) -> int:
+        """Nettoie le cache expiré."""
+        return self.cache.cleanup_expired()
+
 class P3FESTranslator:
     def __init__(self, game_dir: str, output_dir: str):
         """
@@ -833,11 +1034,15 @@ class P3FESTranslator:
         (self.output_dir / 'extracted').mkdir(exist_ok=True)
         (self.output_dir / 'translated').mkdir(exist_ok=True)
         (self.output_dir / 'analysis').mkdir(exist_ok=True)
+        (self.output_dir / 'cache').mkdir(exist_ok=True)
         
         self.special_tokens = SpecialTokens()
         
-        # Initialisation du traducteur Google
-        self.translator = GoogleTranslator(source='en', target='fr')
+        # Service de traduction amélioré avec cache et retry
+        self.translation_service = EnhancedTranslationService(self.output_dir / 'cache')
+        
+        # Patterns regex pré-compilés pour l'optimisation
+        self._compiled_patterns = self._compile_extraction_patterns()
         
         # Initialisation du modèle Hugging Face pour l'analyse de texte
         try:
@@ -851,6 +1056,14 @@ class P3FESTranslator:
             logging.warning(f"Modèle Hugging Face non disponible: {e}")
             logging.info("Continuera sans analyse de sentiment avancée")
             self.text_classifier = None
+    
+    def _compile_extraction_patterns(self) -> List[re.Pattern]:
+        """Compile les patterns regex pour l'extraction pour optimiser les performances."""
+        patterns = [
+            rb'[\x20-\x7E\x80-\xFF]{8,}',  # Chaînes ASCII étendues
+            rb'[\x20-\x7E]{4,}',           # Chaînes ASCII standard
+        ]
+        return [re.compile(pattern) for pattern in patterns]
 
     def _load_processed_files(self) -> Dict[str, str]:
         """Charge la liste des fichiers déjà traités depuis le fichier log."""
@@ -1025,13 +1238,13 @@ class P3FESTranslator:
     
     def auto_process_directory(self, test_mode: bool = True, min_score: float = 0.4):
         """
-        Traite automatiquement tous les fichiers prometteurs du répertoire.
+        Traite automatiquement tous les fichiers prometteurs du répertoire avec parallélisation.
         
         Args:
             test_mode: Si True, teste les méthodes de réinsertion avant application
             min_score: Score minimum pour considérer un fichier comme prometteur
         """
-        logging.info("🚀 Début du traitement automatique...")
+        logging.info("🚀 Début du traitement automatique optimisé...")
         
         # Analyser tous les fichiers
         if not self.analysis_report:
@@ -1046,54 +1259,112 @@ class P3FESTranslator:
         
         print(f"📁 {len(promising_files)} fichier(s) sélectionné(s) pour traitement")
         
+        # Nettoyage du cache avant le début
+        expired_count = self.translation_service.cleanup_cache()
+        if expired_count > 0:
+            print(f"🧹 {expired_count} entrée(s) expirée(s) supprimée(s) du cache")
+        
         # Statistiques
         processed_count = 0
         error_count = 0
         test_results = {}
         
-        for i, file_path in enumerate(promising_files, 1):
-            print(f"\n📄 [{i}/{len(promising_files)}] Traitement: {file_path.name}")
+        # Mode parallélisé pour les gros volumes
+        if len(promising_files) > 5:
+            print("⚡ Mode parallélisé activé pour optimiser les performances")
             
-            try:
-                # Détecter le format pour choisir la stratégie
-                file_format, confidence = self.file_analyzer.detect_file_format(file_path)
-                print(f"  🔍 Format détecté: {file_format} (confiance: {confidence:.1%})")
-                
-                # Si mode test activé, tester les méthodes de réinsertion
-                if test_mode:
-                    print(f"  🧪 Test des méthodes de réinsertion...")
-                    test_result = self.reinsertion_manager.test_reinsertion_methods(file_path, self)
-                    test_results[str(file_path)] = test_result
+            def process_single_file(file_path):
+                """Fonction worker pour le traitement parallèle."""
+                try:
+                    file_format, confidence = self.file_analyzer.detect_file_format(file_path)
                     
-                    if not test_result['success']:
-                        print(f"  ⚠️ Aucune méthode de réinsertion fonctionnelle trouvée")
+                    if test_mode:
+                        test_result = self.reinsertion_manager.test_reinsertion_methods(file_path, self)
+                        if not test_result['success']:
+                            return False, f"Aucune méthode de réinsertion trouvée"
+                    
+                    strategy = self.reinsertion_manager.choose_strategy(file_format, file_path, test_mode)
+                    success = self.process_file_with_strategy(file_path, strategy)
+                    
+                    return success, "Succès" if success else "Échec"
+                    
+                except Exception as e:
+                    return False, str(e)
+            
+            # Traitement parallèle avec ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=2) as executor:  # Limiter à 2 workers pour éviter la saturation API
+                future_to_file = {
+                    executor.submit(process_single_file, file_path): file_path
+                    for file_path in promising_files
+                }
+                
+                for i, future in enumerate(as_completed(future_to_file), 1):
+                    file_path = future_to_file[future]
+                    print(f"\n📄 [{i}/{len(promising_files)}] {file_path.name}")
+                    
+                    try:
+                        success, message = future.result()
+                        if success:
+                            processed_count += 1
+                            print(f"  ✅ {message}")
+                        else:
+                            error_count += 1
+                            print(f"  ❌ {message}")
+                    except Exception as e:
                         error_count += 1
-                        continue
+                        print(f"  ❌ Erreur: {e}")
+        else:
+            # Mode séquentiel pour les petits volumes
+            for i, file_path in enumerate(promising_files, 1):
+                print(f"\n📄 [{i}/{len(promising_files)}] Traitement: {file_path.name}")
+                
+                try:
+                    # Détecter le format pour choisir la stratégie
+                    file_format, confidence = self.file_analyzer.detect_file_format(file_path)
+                    print(f"  🔍 Format détecté: {file_format} (confiance: {confidence:.1%})")
                     
-                    print(f"  ✅ Meilleure stratégie: {test_result['best_strategy']}")
-                
-                # Traitement avec la stratégie adaptée
-                strategy = self.reinsertion_manager.choose_strategy(file_format, file_path, test_mode)
-                print(f"  🔧 Stratégie utilisée: {strategy}")
-                
-                if self.process_file_with_strategy(file_path, strategy):
-                    processed_count += 1
-                    print(f"  ✅ Succès")
-                else:
+                    # Si mode test activé, tester les méthodes de réinsertion
+                    if test_mode:
+                        print(f"  🧪 Test des méthodes de réinsertion...")
+                        test_result = self.reinsertion_manager.test_reinsertion_methods(file_path, self)
+                        test_results[str(file_path)] = test_result
+                        
+                        if not test_result['success']:
+                            print(f"  ⚠️ Aucune méthode de réinsertion fonctionnelle trouvée")
+                            error_count += 1
+                            continue
+                        
+                        print(f"  ✅ Meilleure stratégie: {test_result['best_strategy']}")
+                    
+                    # Traitement avec la stratégie adaptée
+                    strategy = self.reinsertion_manager.choose_strategy(file_format, file_path, test_mode)
+                    print(f"  🔧 Stratégie utilisée: {strategy}")
+                    
+                    if self.process_file_with_strategy(file_path, strategy):
+                        processed_count += 1
+                        print(f"  ✅ Succès")
+                    else:
+                        error_count += 1
+                        print(f"  ❌ Échec")
+                        
+                except Exception as e:
                     error_count += 1
-                    print(f"  ❌ Échec")
-                    
-            except Exception as e:
-                error_count += 1
-                print(f"  ❌ Erreur: {e}")
-                logging.error(f"Erreur lors du traitement de {file_path}: {e}")
+                    print(f"  ❌ Erreur: {e}")
+                    logging.error(f"Erreur lors du traitement de {file_path}: {e}")
         
-        # Rapport final
+        # Rapport final avec statistiques du cache
         print(f"\n📈 RÉSUMÉ DU TRAITEMENT AUTOMATIQUE")
         print("=" * 40)
         print(f"✅ Fichiers traités avec succès: {processed_count}")
         print(f"❌ Fichiers en erreur: {error_count}")
         print(f"📊 Taux de réussite: {processed_count/(processed_count+error_count)*100:.1f}%")
+        
+        # Statistiques du cache
+        cache_stats = self.translation_service.get_cache_stats()
+        print(f"\n💾 STATISTIQUES DU CACHE:")
+        print(f"📈 Taux de hit: {cache_stats['cache_hit_rate']:.1f}%")
+        print(f"🏪 Entrées totales: {cache_stats['cache_stats']['total_entries']}")
+        print(f"🔄 Hits totaux: {cache_stats['cache_stats']['total_hits']}")
         
         # Sauvegarder les résultats de test
         if test_results:
@@ -1143,7 +1414,7 @@ class P3FESTranslator:
     
     def extract_texts(self, file_path: Path) -> Optional[List[str]]:
         """
-        Extraction simple et robuste des textes pour tous les formats supportés.
+        Extraction optimisée des textes avec patterns pré-compilés.
         """
         # Nouveau système: pas de vérification d'extension, on teste tous les fichiers
         out_json = self.output_dir / 'extracted' / (file_path.stem + '.json')
@@ -1155,15 +1426,10 @@ class P3FESTranslator:
             messages = []
             texts = []
             
-            # Patterns multiples pour une meilleure extraction
-            patterns = [
-                rb'[\x20-\x7E\x80-\xFF]{8,}',  # Chaînes ASCII étendues
-                rb'[\x20-\x7E]{4,}',           # Chaînes ASCII standard
-            ]
-            
+            # Utiliser les patterns pré-compilés pour optimiser les performances
             all_matches = set()
-            for pattern in patterns:
-                matches = re.finditer(pattern, data)
+            for pattern in self._compiled_patterns:
+                matches = pattern.finditer(data)
                 for match in matches:
                     if match.group() not in all_matches:
                         all_matches.add(match.group())
@@ -1222,7 +1488,7 @@ class P3FESTranslator:
 
     def translate_texts(self, texts: List[str], file_path: Path = None) -> List[str]:
         """
-        Traduit les textes de l'anglais vers le français avec Google Translator.
+        Traduit les textes avec le service amélioré (cache, retry, parallélisation).
         """
         import time
         import json
@@ -1234,45 +1500,59 @@ class P3FESTranslator:
             "Yukari", "Mitsuru", "Fuuka", "Akihiko", "Tartarus", "Nyx", "SEES", "Aigis", "Junpei", "Shinjiro", "Koromaru", "Elizabeth", "Igor", "Pharos", "Ryoji", "Chidori", "Strega", "Ikutsuki", "Takaya", "Jin", "Ken", "Persona", "Evoker", "S.E.E.S.", "Aragaki", "Makoto", "Minato", "Protagonist", "Yamagishi", "Sanada", "Takeba", "Iori", "Amada", "Tanaka", "Velvet Room", "Paulownia Mall", "Gekkoukan", "Mitsuru Kirijo", "Yukari Takeba", "Fuuka Yamagishi", "Akihiko Sanada", "Junpei Iori", "Shinjiro Aragaki", "Ken Amada", "Koromaru", "Aigis", "Elizabeth", "Igor", "Pharos", "Ryoji Mochizuki", "Chidori", "Takaya", "Jin", "Ikutsuki", "Strega", "Nyx Avatar", "Nyx", "Tartarus", "SEES", "Persona", "Evoker", "S.E.E.S."
         ]
 
-        translated = []
+        # Filtrer les textes à traduire
+        texts_to_translate = []
+        skip_indices = []
         
-        try:
-            total_texts = len(texts)
+        for i, text in enumerate(texts):
+            # Extraction des tokens et du texte propre
+            tokens, clean_text = self.special_tokens.extract_game_tokens(text)
             
-            for i, text in enumerate(texts, 1):
-                self.print_progress(i, total_texts, text)
-                
-                # Extraction des tokens et du texte propre
-                tokens, clean_text = self.special_tokens.extract_game_tokens(text)
-                
-                # Récupération du contexte
-                previous_text = texts[i-2] if i > 1 else None
-                next_text = texts[i] if i < len(texts) else None
-                
-                if not clean_text.strip() or self.should_skip_translation(text, whitelist, previous_text, next_text):
-                    translated.append(text)
-                    continue
-                    
-                try:
-                    # Traduction avec Google Translate
-                    fr = self.translator.translate(clean_text)
-                    if not fr:  # Si la traduction échoue
-                        logging.warning(f"Échec de la traduction pour '{text}', retour au texte original")
-                        fr = text
-                except Exception as e:
-                    logging.error(f"Erreur lors de la traduction de '{text}': {e}")
-                    fr = text
-                
-                # Reconstruction avec les tokens originaux
-                fr = self.special_tokens.reconstruct_text(fr, tokens)
-                translated.append(fr)
-                time.sleep(0.5)  # Pause pour respecter les limites d'API
+            # Récupération du contexte
+            previous_text = texts[i-1] if i > 0 else None
+            next_text = texts[i+1] if i < len(texts)-1 else None
             
-            print()
-
-        except Exception as e:
-            logging.error(f"Erreur lors de la traduction : {e}")
-            return texts
+            if not clean_text.strip() or self.should_skip_translation(text, whitelist, previous_text, next_text):
+                skip_indices.append(i)
+            else:
+                texts_to_translate.append((i, clean_text, tokens))
+        
+        # Traduction par batch avec le service amélioré
+        print(f"🔄 Traduction de {len(texts_to_translate)} textes (cache activé)...")
+        
+        if texts_to_translate:
+            # Extraire seulement les textes propres pour la traduction
+            clean_texts = [item[1] for item in texts_to_translate]
+            
+            # Utiliser la traduction par batch pour l'efficacité
+            if len(clean_texts) > 10:  # Batch seulement si assez de textes
+                translated_clean = self.translation_service.translate_batch(clean_texts, max_workers=3)
+            else:
+                # Traduction séquentielle pour les petits lots
+                translated_clean = []
+                for i, clean_text in enumerate(clean_texts, 1):
+                    self.print_progress(i, len(clean_texts), clean_text)
+                    translated = self.translation_service.translate_with_retry(clean_text)
+                    translated_clean.append(translated)
+                    time.sleep(0.1)  # Petite pause pour éviter les limitations
+        else:
+            translated_clean = []
+        
+        # Reconstruction des textes complets avec tokens
+        translated = texts.copy()  # Commencer par copier tous les textes originaux
+        
+        for j, (original_index, _, tokens) in enumerate(texts_to_translate):
+            if j < len(translated_clean):
+                # Reconstruire avec les tokens originaux
+                reconstructed = self.special_tokens.reconstruct_text(translated_clean[j], tokens)
+                translated[original_index] = reconstructed
+        
+        print()  # Nouvelle ligne après la progression
+        
+        # Afficher les statistiques du cache
+        stats = self.translation_service.get_cache_stats()
+        print(f"📊 Cache: {stats['cache_hit_rate']:.1f}% hits, "
+              f"{stats['cache_stats']['total_entries']} entrées")
 
         # Sauvegarde dans un fichier à part si file_path est fourni
         if file_path is not None:
@@ -1450,7 +1730,7 @@ class P3FESTranslator:
     
     def validate_integration_quality(self, file_path: Path) -> Dict:
         """
-        Valide la qualité de l'intégration après réinsertion.
+        Valide la qualité de l'intégration après réinsertion avec suggestions détaillées.
         Retourne un rapport détaillé.
         """
         try:
@@ -1460,46 +1740,105 @@ class P3FESTranslator:
             # Analyser le statut de traduction
             translation_status = self.file_analyzer.detect_translation_status(file_path)
             
-            # Statistiques
+            # Statistiques de base
             validation_report = {
                 'file': str(file_path),
                 'texts_found': len(new_texts) if new_texts else 0,
                 'translation_status': translation_status['status'],
                 'french_ratio': translation_status['confidence'],
                 'quality_score': 0.0,
-                'recommendations': []
+                'recommendations': [],
+                'detailed_analysis': {},
+                'suggestions': []
             }
             
-            # Calculer le score de qualité
             if new_texts and len(new_texts) > 0:
-                # Compter les textes français vs anglais
+                # Analyse détaillée de la qualité
                 french_count = translation_status.get('french_indicators', 0)
                 english_count = translation_status.get('english_indicators', 0)
                 total_indicators = french_count + english_count
                 
+                # Calcul du score de qualité
                 if total_indicators > 0:
                     french_ratio = french_count / total_indicators
                     validation_report['quality_score'] = french_ratio
                     
-                    if french_ratio >= 0.8:
-                        validation_report['recommendations'].append("✅ Excellente qualité de traduction")
+                    # Analyse détaillée
+                    validation_report['detailed_analysis'] = {
+                        'french_indicators': french_count,
+                        'english_indicators': english_count,
+                        'total_texts': len(new_texts),
+                        'translation_coverage': french_ratio,
+                        'estimated_completion': min(100, french_ratio * 100)
+                    }
+                    
+                    # Recommandations basées sur la qualité
+                    if french_ratio >= 0.9:
+                        validation_report['recommendations'].append("🌟 Excellente qualité - Traduction quasi-complète")
+                        validation_report['suggestions'].append("Considérez ce fichier comme terminé")
+                    elif french_ratio >= 0.7:
+                        validation_report['recommendations'].append("✅ Très bonne qualité de traduction")
+                        validation_report['suggestions'].append("Quelques textes pourraient nécessiter une révision")
                     elif french_ratio >= 0.5:
-                        validation_report['recommendations'].append("✅ Bonne qualité de traduction")  
-                    elif french_ratio >= 0.2:
+                        validation_report['recommendations'].append("✅ Bonne qualité de traduction")
+                        validation_report['suggestions'].append("Re-traitement recommandé pour améliorer la couverture")
+                    elif french_ratio >= 0.3:
                         validation_report['recommendations'].append("⚠️ Traduction partielle détectée")
-                    else:
+                        validation_report['suggestions'].append("Vérifiez les paramètres d'extraction et de réinsertion")
+                    elif french_ratio >= 0.1:
                         validation_report['recommendations'].append("❌ Peu de traductions détectées")
+                        validation_report['suggestions'].append("Le fichier pourrait nécessiter un traitement spécialisé")
+                    else:
+                        validation_report['recommendations'].append("❌ Traduction non détectée")
+                        validation_report['suggestions'].append("Vérifiez la compatibilité du format de fichier")
+                    
+                    # Suggestions spécifiques selon le ratio
+                    if english_count > french_count * 2:
+                        validation_report['suggestions'].append("Nombreux textes anglais restants - considérez un re-traitement")
+                    
+                    if french_count > 0 and english_count == 0:
+                        validation_report['suggestions'].append("Traduction complète détectée - excellent travail!")
+                    
+                    # Analyse de la longueur des textes
+                    if new_texts:
+                        avg_length = sum(len(text) for text in new_texts) / len(new_texts)
+                        validation_report['detailed_analysis']['average_text_length'] = avg_length
+                        
+                        if avg_length < 5:
+                            validation_report['suggestions'].append("Textes très courts - possibles codes ou identifiants")
+                        elif avg_length > 100:
+                            validation_report['suggestions'].append("Textes longs détectés - vérifiez l'intégrité")
+                
                 else:
                     validation_report['recommendations'].append("ℹ️ Aucun indicateur de langue détecté")
+                    validation_report['suggestions'].append("Fichier peut ne pas contenir de texte traduisible")
             else:
                 validation_report['recommendations'].append("⚠️ Aucun texte extrait du fichier")
+                validation_report['suggestions'].append("Vérifiez le format et la compatibilité du fichier")
             
-            # Vérifier la taille du fichier
+            # Analyse de la taille du fichier
             file_size = file_path.stat().st_size
             validation_report['file_size'] = file_size
+            validation_report['detailed_analysis']['file_size_kb'] = file_size // 1024
             
             if file_size > 1024 * 1024:  # > 1MB
-                validation_report['recommendations'].append(f"📊 Fichier volumineux: {file_size // 1024}KB (expansion réussie)")
+                validation_report['recommendations'].append(f"📊 Fichier volumineux: {file_size // 1024}KB")
+                validation_report['suggestions'].append("Expansion réussie - traductions longues intégrées")
+            elif file_size > 100 * 1024:  # > 100KB
+                validation_report['suggestions'].append("Taille normale pour un fichier de jeu")
+            else:
+                validation_report['suggestions'].append("Fichier petit - peut contenir peu de texte")
+            
+            # Score global basé sur plusieurs facteurs
+            size_factor = min(1.0, file_size / (100 * 1024))  # Normaliser sur 100KB
+            text_factor = min(1.0, len(new_texts) / 10) if new_texts else 0  # Normaliser sur 10 textes
+            
+            final_score = (
+                validation_report['quality_score'] * 0.6 +  # 60% qualité traduction
+                size_factor * 0.2 +                         # 20% taille fichier
+                text_factor * 0.2                           # 20% nombre de textes
+            )
+            validation_report['quality_score'] = round(final_score, 3)
             
             return validation_report
             
@@ -1508,7 +1847,9 @@ class P3FESTranslator:
                 'file': str(file_path),
                 'error': str(e),
                 'quality_score': 0.0,
-                'recommendations': [f"❌ Erreur de validation: {e}"]
+                'recommendations': [f"❌ Erreur de validation: {e}"],
+                'suggestions': ["Vérifiez l'intégrité du fichier et les permissions"],
+                'detailed_analysis': {'error': True}
             }
     
     def process_file(self, file_path: Path) -> bool:
@@ -1681,6 +2022,235 @@ class P3FESTranslator:
             
         return False
 
+class P3FESTranslatorGUI:
+    """Interface graphique simple pour le traducteur."""
+    
+    def __init__(self):
+        if not GUI_AVAILABLE:
+            raise ImportError("Interface graphique non disponible")
+        
+        self.root = tk.Tk()
+        self.root.title("Persona 3 FES - Traducteur Français")
+        self.root.geometry("800x600")
+        
+        self.translator = None
+        self.processing = False
+        
+        self.setup_ui()
+    
+    def setup_ui(self):
+        """Configure l'interface utilisateur."""
+        # Frame principal
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # Configuration des chemins
+        paths_frame = ttk.LabelFrame(main_frame, text="Configuration des chemins", padding="10")
+        paths_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        
+        ttk.Label(paths_frame, text="Dossier du jeu:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.game_dir_var = tk.StringVar(value="GameFiles")
+        ttk.Entry(paths_frame, textvariable=self.game_dir_var, width=50).grid(row=0, column=1, padx=5)
+        ttk.Button(paths_frame, text="Parcourir", command=self.browse_game_dir).grid(row=0, column=2)
+        
+        ttk.Label(paths_frame, text="Dossier de sortie:").grid(row=1, column=0, sticky=tk.W, pady=2)
+        self.output_dir_var = tk.StringVar(value="TranslatedFiles")
+        ttk.Entry(paths_frame, textvariable=self.output_dir_var, width=50).grid(row=1, column=1, padx=5)
+        ttk.Button(paths_frame, text="Parcourir", command=self.browse_output_dir).grid(row=1, column=2)
+        
+        # Options
+        options_frame = ttk.LabelFrame(main_frame, text="Options", padding="10")
+        options_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        
+        self.test_mode_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(options_frame, text="Mode test (recommandé)", variable=self.test_mode_var).grid(row=0, column=0, sticky=tk.W)
+        
+        self.parallel_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(options_frame, text="Mode parallélisé", variable=self.parallel_var).grid(row=0, column=1, sticky=tk.W)
+        
+        ttk.Label(options_frame, text="Score minimum:").grid(row=1, column=0, sticky=tk.W, pady=2)
+        self.min_score_var = tk.DoubleVar(value=0.4)
+        ttk.Scale(options_frame, from_=0.1, to=1.0, variable=self.min_score_var, orient=tk.HORIZONTAL).grid(row=1, column=1, sticky=(tk.W, tk.E))
+        self.score_label = ttk.Label(options_frame, text="0.4")
+        self.score_label.grid(row=1, column=2)
+        
+        self.min_score_var.trace('w', self.update_score_label)
+        
+        # Boutons d'action
+        buttons_frame = ttk.Frame(main_frame)
+        buttons_frame.grid(row=2, column=0, columnspan=2, pady=10)
+        
+        ttk.Button(buttons_frame, text="Analyser les fichiers", command=self.analyze_files).grid(row=0, column=0, padx=5)
+        ttk.Button(buttons_frame, text="Traitement automatique", command=self.auto_process).grid(row=0, column=1, padx=5)
+        ttk.Button(buttons_frame, text="Voir le progrès", command=self.show_progress).grid(row=0, column=2, padx=5)
+        ttk.Button(buttons_frame, text="Stats du cache", command=self.show_cache_stats).grid(row=0, column=3, padx=5)
+        
+        # Zone de texte pour les logs
+        log_frame = ttk.LabelFrame(main_frame, text="Journal", padding="5")
+        log_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        
+        self.log_text = tk.Text(log_frame, height=15, wrap=tk.WORD)
+        scrollbar = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=scrollbar.set)
+        
+        self.log_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        
+        # Barre de progression
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(main_frame, variable=self.progress_var, maximum=100)
+        self.progress_bar.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        
+        # Status bar
+        self.status_var = tk.StringVar(value="Prêt")
+        status_bar = ttk.Label(main_frame, textvariable=self.status_var, relief=tk.SUNKEN)
+        status_bar.grid(row=5, column=0, columnspan=2, sticky=(tk.W, tk.E))
+        
+        # Configuration de la grille
+        main_frame.columnconfigure(1, weight=1)
+        main_frame.rowconfigure(3, weight=1)
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(0, weight=1)
+        paths_frame.columnconfigure(1, weight=1)
+        options_frame.columnconfigure(1, weight=1)
+    
+    def update_score_label(self, *args):
+        """Met à jour l'affichage du score."""
+        self.score_label.config(text=f"{self.min_score_var.get():.1f}")
+    
+    def browse_game_dir(self):
+        """Sélectionne le dossier du jeu."""
+        dir_path = filedialog.askdirectory(title="Sélectionner le dossier du jeu")
+        if dir_path:
+            self.game_dir_var.set(dir_path)
+    
+    def browse_output_dir(self):
+        """Sélectionne le dossier de sortie."""
+        dir_path = filedialog.askdirectory(title="Sélectionner le dossier de sortie")
+        if dir_path:
+            self.output_dir_var.set(dir_path)
+    
+    def log(self, message):
+        """Ajoute un message au journal."""
+        self.log_text.insert(tk.END, message + "\n")
+        self.log_text.see(tk.END)
+        self.root.update()
+    
+    def get_translator(self):
+        """Obtient une instance du traducteur."""
+        if not self.translator:
+            self.translator = P3FESTranslator(self.game_dir_var.get(), self.output_dir_var.get())
+        return self.translator
+    
+    def analyze_files(self):
+        """Lance l'analyse des fichiers."""
+        if self.processing:
+            return
+        
+        self.processing = True
+        self.status_var.set("Analyse en cours...")
+        self.progress_var.set(0)
+        
+        try:
+            translator = self.get_translator()
+            self.log("🔍 Début de l'analyse des fichiers...")
+            
+            analysis_report = translator.analyze_all_files()
+            
+            # Afficher les résultats
+            self.log(f"📊 Analyse terminée !")
+            self.log(f"📁 Fichiers analysés: {analysis_report['analyzed_files']}")
+            self.log(f"🎯 Fichiers à traiter: {len(analysis_report['untranslated_files'])}")
+            self.log(f"✅ Fichiers traduits: {len(analysis_report['translated_files'])}")
+            
+            summary = analysis_report['translation_summary']
+            if summary['fully_translated'] > 0:
+                progress = (summary['fully_translated'] / analysis_report['analyzed_files']) * 100
+                self.progress_var.set(progress)
+                self.log(f"📈 Progrès: {progress:.1f}%")
+            
+            self.status_var.set("Analyse terminée")
+            
+        except Exception as e:
+            self.log(f"❌ Erreur: {e}")
+            messagebox.showerror("Erreur", f"Erreur lors de l'analyse: {e}")
+        finally:
+            self.processing = False
+    
+    def auto_process(self):
+        """Lance le traitement automatique."""
+        if self.processing:
+            return
+        
+        if not messagebox.askyesno("Confirmation", "Lancer le traitement automatique ?"):
+            return
+        
+        self.processing = True
+        self.status_var.set("Traitement en cours...")
+        
+        try:
+            translator = self.get_translator()
+            self.log("🚀 Début du traitement automatique...")
+            
+            # Cette méthode devrait être adaptée pour utiliser des callbacks
+            translator.auto_process_directory(
+                test_mode=self.test_mode_var.get(),
+                min_score=self.min_score_var.get()
+            )
+            
+            self.log("✅ Traitement automatique terminé !")
+            self.status_var.set("Traitement terminé")
+            
+        except Exception as e:
+            self.log(f"❌ Erreur: {e}")
+            messagebox.showerror("Erreur", f"Erreur lors du traitement: {e}")
+        finally:
+            self.processing = False
+    
+    def show_progress(self):
+        """Affiche le progrès détaillé."""
+        try:
+            translator = self.get_translator()
+            if not translator.analysis_report:
+                translator.analyze_all_files()
+            
+            summary = translator.analysis_report['translation_summary']
+            total = translator.analysis_report['analyzed_files']
+            
+            progress_text = f"📊 PROGRÈS DE TRADUCTION:\n"
+            progress_text += f"📁 Total: {total} fichiers\n"
+            progress_text += f"✅ Traduits: {summary['fully_translated']} ({summary['fully_translated']/total*100:.1f}%)\n"
+            progress_text += f"🔶 Partiels: {summary['partially_translated']}\n"
+            progress_text += f"❌ Non traduits: {summary['not_translated']}\n"
+            
+            messagebox.showinfo("Progrès de traduction", progress_text)
+            
+        except Exception as e:
+            messagebox.showerror("Erreur", f"Erreur: {e}")
+    
+    def show_cache_stats(self):
+        """Affiche les statistiques du cache."""
+        try:
+            translator = self.get_translator()
+            stats = translator.translation_service.get_cache_stats()
+            
+            stats_text = f"💾 STATISTIQUES DU CACHE:\n"
+            stats_text += f"📊 Taux de hit: {stats['cache_hit_rate']:.1f}%\n"
+            stats_text += f"🏪 Entrées: {stats['cache_stats']['total_entries']}\n"
+            stats_text += f"🔄 Hits: {stats['cache_stats']['total_hits']}\n"
+            stats_text += f"🆕 Récentes: {stats['cache_stats']['recent_entries']}\n"
+            
+            messagebox.showinfo("Statistiques du cache", stats_text)
+            
+        except Exception as e:
+            messagebox.showerror("Erreur", f"Erreur: {e}")
+    
+    def run(self):
+        """Lance l'interface graphique."""
+        self.log("🎮 Interface graphique du traducteur Persona 3 FES")
+        self.log("💡 Sélectionnez les dossiers et cliquez sur 'Analyser les fichiers' pour commencer")
+        self.root.mainloop()
+
 def main():
     """Point d'entrée principal du programme."""
     import argparse
@@ -1692,6 +2262,7 @@ def main():
     parser.add_argument('--file', help='Traduire un fichier spécifique')
     parser.add_argument('--test', action='store_true', help='Mode test (analyse sans traduction)')
     parser.add_argument('--verbose', action='store_true', help='Mode verbose')
+    parser.add_argument('--gui', action='store_true', help='Lancer l\'interface graphique')
     
     # Nouvelles options pour l'analyse automatique
     parser.add_argument('--analyze', action='store_true', help='Analyser tous les fichiers pour détecter le contenu traduisible')
@@ -1703,6 +2274,46 @@ def main():
     parser.add_argument('--progress', action='store_true', help='Affiche le progrès de traduction et statistiques détaillées')
     parser.add_argument('--validate', action='store_true', help='Valide la qualité des traductions dans les fichiers existants')
     parser.add_argument('--validate-file', help='Valide la qualité de traduction d\'un fichier spécifique')
+    parser.add_argument('--cache-stats', action='store_true', help='Affiche les statistiques du cache de traduction')
+    parser.add_argument('--clean-cache', action='store_true', help='Nettoie le cache de traduction expiré')
+    parser.add_argument('--parallel', action='store_true', help='Force le mode parallélisé même pour peu de fichiers')
+    
+    # Nouvelle option pour la stratégie de traduction
+    parser.add_argument('--strategy', choices=['professional', 'preserve', 'mixed'], 
+                       default='professional', 
+                       help='Stratégie pour gérer les traductions trop longues (défaut: professional)')
+    parser.add_argument('--show-strategies', action='store_true', 
+                       help='Affiche les stratégies disponibles et leurs descriptions')
+    
+    args = parser.parse_args()
+    
+    # Interface graphique
+    if args.gui:
+        if not GUI_AVAILABLE:
+            print("❌ Interface graphique non disponible (tkinter manquant)")
+            sys.exit(1)
+        
+        try:
+            app = P3FESTranslatorGUI()
+            app.run()
+            return
+        except Exception as e:
+            print(f"❌ Erreur interface graphique: {e}")
+            sys.exit(1)
+    
+    # Nouvelles options pour l'analyse automatique
+    parser.add_argument('--analyze', action='store_true', help='Analyser tous les fichiers pour détecter le contenu traduisible')
+    parser.add_argument('--auto', action='store_true', help='Mode automatique: analyse + traitement intelligent')
+    parser.add_argument('--auto-test', action='store_true', help='Mode automatique avec test des méthodes de réinsertion')
+    parser.add_argument('--min-score', type=float, default=0.4, help='Score minimum pour considérer un fichier (0.0-1.0)')
+    parser.add_argument('--max-files', type=int, help='Limite le nombre de fichiers à analyser')
+    parser.add_argument('--remaining', action='store_true', help='Affiche seulement les fichiers restants à traduire')
+    parser.add_argument('--progress', action='store_true', help='Affiche le progrès de traduction et statistiques détaillées')
+    parser.add_argument('--validate', action='store_true', help='Valide la qualité des traductions dans les fichiers existants')
+    parser.add_argument('--validate-file', help='Valide la qualité de traduction d\'un fichier spécifique')
+    parser.add_argument('--cache-stats', action='store_true', help='Affiche les statistiques du cache de traduction')
+    parser.add_argument('--clean-cache', action='store_true', help='Nettoie le cache de traduction expiré')
+    parser.add_argument('--parallel', action='store_true', help='Force le mode parallélisé même pour peu de fichiers')
     
     # Nouvelle option pour la stratégie de traduction
     parser.add_argument('--strategy', choices=['professional', 'preserve', 'mixed'], 
@@ -1891,6 +2502,27 @@ def main():
                     print(f"  {rec}")
             else:
                 print(f"❌ Fichier non trouvé: {file_path}")
+            
+        elif args.cache_stats:
+            # Affichage des statistiques du cache
+            translator = P3FESTranslator(args.game_dir, args.output_dir)
+            stats = translator.translation_service.get_cache_stats()
+            
+            print("💾 STATISTIQUES DU CACHE DE TRADUCTION")
+            print("=" * 40)
+            print(f"📊 Taux de hit: {stats['cache_hit_rate']:.1f}%")
+            print(f"🏪 Entrées totales: {stats['cache_stats']['total_entries']}")
+            print(f"🔄 Hits totaux: {stats['cache_stats']['total_hits']}")
+            print(f"🆕 Entrées récentes (24h): {stats['cache_stats']['recent_entries']}")
+            print(f"📈 Traductions demandées: {stats['service_stats']['translations_requested']}")
+            print(f"✅ Traductions réussies: {stats['service_stats']['successful_translations']}")
+            print(f"❌ Erreurs de traduction: {stats['service_stats']['translation_errors']}")
+            
+        elif args.clean_cache:
+            # Nettoyage du cache
+            translator = P3FESTranslator(args.game_dir, args.output_dir)
+            cleaned = translator.translation_service.cleanup_cache()
+            print(f"🧹 Cache nettoyé: {cleaned} entrée(s) expirée(s) supprimée(s)")
             
         elif args.auto or args.auto_test:
             # Mode automatique
